@@ -1,13 +1,17 @@
-from .config import WIFI_CARD_ADDRESS, WEB_PATH_PREFIX, SOCKET_TIMEOUT
+from .config import DELUGE_MIDI_PORT_NAME, MIDI_TIMEOUT
+from .config import DELUGE_MANUFACTURER_ID, DELUGE_DEVICE_ID, SYSEX_START, SYSEX_EOX
+from .config import SYSEX_CMD_JSON, SYSEX_DEBUG_START, create_session_request
 from .config import WATCH_FOR_NEW_SAVES, NEW_SAVE_SLEEP_TIMER
 from .deluge2ableton import Deluge2Ableton
 from .local import propername, displayname
 
 import _thread
-import socket
 import logging
 import re
 import time
+import mido
+import json
+import uuid
 
 from time import sleep
 
@@ -148,38 +152,406 @@ class Fetcher(object):
         if not delugesong:
             return ''
 
-        url = f'/{WEB_PATH_PREFIX}/SONG{delugesong}.XML'
-
-        request = f"GET {url} HTTP/1.0\r\nHost: {WIFI_CARD_ADDRESS}\r\n\r\n"
-
+        # Use DelugeWeb file reading protocol to fetch song XML files from SONGS directory
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(SOCKET_TIMEOUT)
-            s.connect((WIFI_CARD_ADDRESS, 80))
-            s.send(request.encode('utf-8'))
-
-            body = ""
-
-            while True:
-                part = s.recv(999999)
-
-                if not part:
+            # Find the Deluge MIDI port
+            deluge_port = None
+            available_ports = mido.get_output_names()
+            
+            for port_name in available_ports:
+                if DELUGE_MIDI_PORT_NAME in port_name:
+                    deluge_port = port_name
                     break
+            
+            if not deluge_port:
+                logger.info(f'ERROR: Deluge MIDI port "{DELUGE_MIDI_PORT_NAME}" not found')
+                logger.info(f'Available ports: {available_ports}')
+                return None
 
-                body += part.decode('utf-8')
+            # Open MIDI connection
+            with mido.open_output(deluge_port) as outport, mido.open_input(deluge_port) as inport:
+                # First, establish a session with the Deluge
+                session_uuid = str(uuid.uuid4())
+                session_request = create_session_request(session_uuid)
+                
+                logger.info(f'Establishing session with Deluge for song {delugesong}...')
+                sysex_msg = mido.Message('sysex', data=session_request)
+                outport.send(sysex_msg)
+                
+                # Wait for session response
+                session_established = False
+                session_data = None
+                timeout_time = time.time() + MIDI_TIMEOUT
+                
+                while time.time() < timeout_time:
+                    for msg in inport.iter_pending():
+                        if msg.type == 'sysex':
+                            session_data = self._handle_session_response(msg.data, session_uuid)
+                            if session_data:
+                                session_established = True
+                                break
+                    if session_established:
+                        break
+                    time.sleep(0.01)
+                
+                if not session_established:
+                    logger.info(f'ERROR: Could not establish session with Deluge')
+                    return None
+                
+                # Get sequence number range from session
+                seq_min = session_data.get('seqMin', 1)
+                seq_max = session_data.get('seqMax', 254)
+                current_seq = seq_min
+                
+                # Construct song file path (SONG001.XML format)
+                song_filename = f"SONG{delugesong.upper().zfill(3)}.XML"
+                song_path = f"/SONGS/{song_filename}"
+                
+                logger.info(f'Requesting song file: {song_path}')
+                
+                # Open the song file
+                file_data = self._read_file_from_deluge(outport, inport, song_path, current_seq, seq_max)
+                
+                if file_data:
+                    # Convert bytes to string (XML)
+                    xml_content = file_data.decode('utf-8', errors='ignore')
+                    logger.info(f'Successfully read song file {song_filename} ({len(xml_content)} characters)')
+                    return xml_content
+                else:
+                    logger.info(f'Song file {song_filename} not found or could not be read')
+                    return None
 
-            s.close()
         except Exception as e:
-            logger.info(f'ERROR: Socket Exception {e}')
+            logger.info(f'ERROR: MIDI Exception {e}')
+            return None
+    
+    def _handle_session_response(self, data, expected_uuid):
+        """Handle session establishment response from Deluge"""
+        try:
+            # Check if this is a Deluge JSON response
+            if (len(data) > 7 and 
+                data[1:4] == DELUGE_MANUFACTURER_ID and 
+                data[4] == DELUGE_DEVICE_ID and 
+                data[5] == 0x05):  # JSON response command
+                
+                # Extract JSON payload
+                json_start = 7
+                json_end = len(data) - 1  # Remove SYSEX_EOX
+                json_bytes = data[json_start:json_end]
+                json_str = json_bytes.decode('utf-8')
+                
+                response = json.loads(json_str)
+                if '^session' in response:
+                    session_data = response['^session']
+                    if session_data.get('tag') == expected_uuid:
+                        logger.info(f'Session established successfully')
+                        return session_data  # Return the full session data
+        except Exception as e:
+            logger.info(f'Error parsing session response: {e}')
+        
+        return None
+    
+    def _handle_song_response(self, data):
+        """Handle song data response from Deluge (when implemented)"""
+        try:
+            # Check if this is a Deluge JSON response
+            if (len(data) > 7 and 
+                data[1:4] == DELUGE_MANUFACTURER_ID and 
+                data[4] == DELUGE_DEVICE_ID and 
+                data[5] == 0x05):  # JSON response command
+                
+                # Extract JSON payload
+                json_start = 7
+                json_end = len(data) - 1  # Remove SYSEX_EOX
+                json_bytes = data[json_start:json_end]
+                json_str = json_bytes.decode('utf-8')
+                
+                response = json.loads(json_str)
+                if 'songData' in response:
+                    song_data = response['songData']
+                    if 'xml' in song_data:
+                        return song_data['xml']
+        except Exception as e:
+            logger.info(f'Error parsing song response: {e}')
+        
+        return None
+    
+    def _read_file_from_deluge(self, outport, inport, file_path, seq_num, seq_max):
+        """Read a file from Deluge using DelugeWeb protocol"""
+        try:
+            # Step 1: Open the file
+            open_cmd = {
+                "open": {
+                    "path": file_path
+                }
+            }
+            
+            fid = self._send_json_command(outport, inport, open_cmd, seq_num)
+            if not fid:
+                logger.info(f'Could not open file: {file_path}')
+                return None
+            
+            seq_num = (seq_num + 1) if seq_num < seq_max else 1
+            
+            # Step 2: Read data in blocks
+            file_data = bytearray()
+            block_size = 512
+            current_addr = 0
+            
+            while True:
+                read_cmd = {
+                    "read": {
+                        "fid": fid,
+                        "addr": current_addr,
+                        "size": block_size
+                    }
+                }
+                
+                block_data = self._send_json_command_with_data(outport, inport, read_cmd, seq_num)
+                if not block_data:
+                    break
+                
+                file_data.extend(block_data)
+                current_addr += len(block_data)
+                
+                # If we got less than block_size, we've reached the end
+                if len(block_data) < block_size:
+                    break
+                
+                seq_num = (seq_num + 1) if seq_num < seq_max else 1
+            
+            # Step 3: Close the file
+            close_cmd = {
+                "close": {
+                    "fid": fid
+                }
+            }
+            self._send_json_command(outport, inport, close_cmd, seq_num)
+            
+            return bytes(file_data)
+            
+        except Exception as e:
+            logger.info(f'Error reading file {file_path}: {e}')
+            return None
+    
+    def _send_json_command(self, outport, inport, command, seq_num):
+        """Send a JSON command and wait for response"""
+        try:
+            # Encode JSON command
+            cmd_json = json.dumps(command).encode('utf-8')
+            
+            # Build SysEx message
+            sysex_data = ([SYSEX_START] + DELUGE_MANUFACTURER_ID + 
+                         [DELUGE_DEVICE_ID, SYSEX_CMD_JSON, seq_num] + 
+                         list(cmd_json) + [SYSEX_EOX])
+            
+            # Send command
+            sysex_msg = mido.Message('sysex', data=sysex_data)
+            outport.send(sysex_msg)
+            
+            # Wait for response
+            timeout_time = time.time() + MIDI_TIMEOUT
+            
+            while time.time() < timeout_time:
+                for msg in inport.iter_pending():
+                    if msg.type == 'sysex':
+                        response = self._parse_json_response(msg.data)
+                        if response:
+                            return self._extract_response_data(response, command)
+                time.sleep(0.01)
+            
+            return None
+            
+        except Exception as e:
+            logger.info(f'Error sending JSON command: {e}')
+            return None
+    
+    def _parse_json_response(self, data):
+        """Parse JSON response from SysEx data"""
+        try:
+            # Check if this is a Deluge JSON response
+            if (len(data) > 7 and 
+                data[1:4] == DELUGE_MANUFACTURER_ID and 
+                data[4] == DELUGE_DEVICE_ID and 
+                data[5] == 0x05):  # JSON response command
+                
+                # Extract JSON payload
+                json_start = 7
+                json_end = len(data) - 1  # Remove SYSEX_EOX
+                json_bytes = data[json_start:json_end]
+                json_str = json_bytes.decode('utf-8')
+                
+                return json.loads(json_str)
+        except Exception as e:
+            logger.info(f'Error parsing JSON response: {e}')
+        
+        return None
+    
+    def _extract_response_data(self, response, original_command):
+        """Extract relevant data from JSON response based on original command"""
+        try:
+            cmd_type = list(original_command.keys())[0]
+            
+            if cmd_type == "open":
+                if "^open" in response:
+                    open_resp = response["^open"]
+                    if open_resp.get("err") == 0:
+                        return open_resp.get("fid")
+            
+            elif cmd_type == "read":
+                if "^read" in response:
+                    read_resp = response["^read"]
+                    if read_resp.get("err") == 0:
+                        # For read commands, we need to extract binary data
+                        # This is placeholder - binary data extraction needs SysEx message context
+                        return b""  # Will be updated when we have the full SysEx parsing
+            
+            elif cmd_type == "close":
+                if "^close" in response:
+                    close_resp = response["^close"]
+                    if close_resp.get("err") == 0:
+                        return True
+        
+        except Exception as e:
+            logger.info(f'Error extracting response data: {e}')
+        
+        return None
+    
+    def _send_json_command_with_data(self, outport, inport, command, seq_num):
+        """Send a JSON command and wait for response with binary data extraction"""
+        try:
+            # Encode JSON command
+            cmd_json = json.dumps(command).encode('utf-8')
+            
+            # Build SysEx message
+            sysex_data = ([SYSEX_START] + DELUGE_MANUFACTURER_ID + 
+                         [DELUGE_DEVICE_ID, SYSEX_CMD_JSON, seq_num] + 
+                         list(cmd_json) + [SYSEX_EOX])
+            
+            # Send command
+            sysex_msg = mido.Message('sysex', data=sysex_data)
+            outport.send(sysex_msg)
+            
+            # Wait for response
+            timeout_time = time.time() + MIDI_TIMEOUT
+            
+            while time.time() < timeout_time:
+                for msg in inport.iter_pending():
+                    if msg.type == 'sysex':
+                        # For read commands, we need to extract binary data from full SysEx
+                        cmd_type = list(command.keys())[0]
+                        if cmd_type == "read":
+                            return self._extract_read_data(msg.data)
+                        else:
+                            response = self._parse_json_response(msg.data)
+                            if response:
+                                return self._extract_response_data(response, command)
+                time.sleep(0.01)
+            
+            return None
+            
+        except Exception as e:
+            logger.info(f'Error sending JSON command with data: {e}')
+            return None
+    
+    def _extract_read_data(self, sysex_data):
+        """Extract binary data from read command response"""
+        try:
+            # First parse the JSON response to check for errors
+            response = self._parse_json_response(sysex_data)
+            if not response or "^read" not in response:
+                return None
+            
+            read_resp = response["^read"]
+            if read_resp.get("err") != 0:
+                return None
+            
+            # Look for binary data separator (0x00) after JSON
+            json_start = 7
+            json_end = len(sysex_data) - 1  # Remove SYSEX_EOX
+            
+            # Find end of JSON data by looking for null separator
+            separator_pos = -1
+            for i in range(json_start, json_end):
+                if sysex_data[i] == 0x00:
+                    separator_pos = i
+                    break
+            
+            if separator_pos > 0:
+                # Extract binary data after separator
+                binary_data = self._extract_attached_data(sysex_data, separator_pos)
+                return bytes(binary_data)
+            
+            return b""  # No binary data found
+            
+        except Exception as e:
+            logger.info(f'Error extracting read data: {e}')
             return None
 
-
-        if "\r\n\r\n" in body:
-            return body.split("\r\n\r\n", 2)[1]
-
-        return ''
-
-
+    def _unpack_7bit_to_8bit(self, src_data, src_offset, src_len):
+        """Unpack 7-bit MIDI data to 8-bit binary data (from DelugeWeb)"""
+        try:
+            packets = (src_len + 7) // 8  # Ceiling division
+            missing = (8 * packets - src_len)
+            if missing == 7:  # This would be weird
+                packets -= 1
+                missing = 0
+            
+            out_len = 7 * packets - missing
+            if out_len <= 0:
+                return bytearray()
+            
+            dst = bytearray(out_len)
+            
+            for i in range(packets):
+                ipos = 8 * i
+                opos = 7 * i
+                
+                # Fill output section with zeros
+                for j in range(7):
+                    if opos + j >= out_len:
+                        break
+                    dst[opos + j] = 0
+                
+                # Unpack data
+                for j in range(7):
+                    if j + 1 + ipos >= src_len:
+                        break
+                    if opos + j >= out_len:
+                        break
+                    
+                    dst[opos + j] = src_data[src_offset + ipos + 1 + j] & 0x7f
+                    if src_data[src_offset + ipos] & (1 << j):
+                        dst[opos + j] |= 0x80
+            
+            return dst
+        except Exception as e:
+            logger.info(f'Error unpacking 7-bit data: {e}')
+            return bytearray()
+    
+    def _extract_attached_data(self, data, zero_x_pos):
+        """Extract attached binary data from SysEx message"""
+        try:
+            tot_len = len(data)
+            att_len = tot_len - zero_x_pos - 2  # Ignore 0 separator & ending 0xF7
+            
+            if att_len <= 0:
+                return bytearray()
+            
+            # Calculate expected output size
+            packets = (att_len + 7) // 8
+            missing = (8 * packets - att_len)
+            if missing == 7:
+                packets -= 1
+                missing = 0
+            out_len = 7 * packets - missing
+            
+            # Unpack the data
+            return self._unpack_7bit_to_8bit(data, zero_x_pos + 1, att_len)
+            
+        except Exception as e:
+            logger.info(f'Error extracting attached data: {e}')
+            return bytearray()
 
     def _nextsongname(self, name):
         def nextletter(letter):

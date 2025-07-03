@@ -54,8 +54,8 @@ SYSEX_EOX = 0xF7
 
 # Command types
 SYSEX_CMD_DEBUG = 0x03      # Debug/logging messages  
-SYSEX_CMD_JSON = 0x06       # JSON commands
-SYSEX_CMD_JSON_REPLY = 0x07 # JSON responses
+SYSEX_CMD_JSON = 0x04       # JSON commands (SysEx::SysexCommands::Json)
+SYSEX_CMD_JSON_REPLY = 0x05 # JSON responses (SysEx::SysexCommands::JsonReply)
 
 # Debug command subcodes
 DEBUG_START = 0x01  # Start debug logging

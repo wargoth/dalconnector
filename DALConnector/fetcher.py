@@ -1,6 +1,6 @@
 from .config import DELUGE_MIDI_PORT_NAME, MIDI_TIMEOUT
 from .config import DELUGE_MANUFACTURER_ID, DELUGE_DEVICE_ID, SYSEX_START, SYSEX_EOX
-from .config import SYSEX_CMD_JSON, SYSEX_DEBUG_START, create_session_request
+from .config import SYSEX_CMD_JSON, SYSEX_CMD_JSON_REPLY, SYSEX_DEBUG_START, create_session_request
 from .config import WATCH_FOR_NEW_SAVES, NEW_SAVE_SLEEP_TIMER
 from .deluge2ableton import Deluge2Ableton
 from .local import propername, displayname
@@ -199,8 +199,8 @@ class Fetcher(object):
                     return None
                 
                 # Get sequence number range from session
-                seq_min = session_data.get('seqMin', 1)
-                seq_max = session_data.get('seqMax', 254)
+                seq_min = session_data.get('midMin', 1)
+                seq_max = session_data.get('midMax', 254)
                 current_seq = seq_min
                 
                 # Construct song file path (SONG001.XML format)
@@ -232,7 +232,7 @@ class Fetcher(object):
             if (len(data) > 7 and 
                 data[1:4] == DELUGE_MANUFACTURER_ID and 
                 data[4] == DELUGE_DEVICE_ID and 
-                data[5] == 0x07):  # JSON response command (0x07)
+                data[5] == SYSEX_CMD_JSON_REPLY):  # JSON response command
                 
                 # Extract JSON payload
                 json_start = 7
@@ -386,7 +386,7 @@ class Fetcher(object):
             if (len(data) > 7 and 
                 data[1:4] == DELUGE_MANUFACTURER_ID and 
                 data[4] == DELUGE_DEVICE_ID and 
-                data[5] == 0x07):  # JSON response command (0x07)
+                data[5] == SYSEX_CMD_JSON_REPLY):  # JSON response command
                 
                 # Extract JSON payload
                 json_start = 7

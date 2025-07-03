@@ -232,7 +232,7 @@ class Fetcher(object):
             if (len(data) > 7 and 
                 data[1:4] == DELUGE_MANUFACTURER_ID and 
                 data[4] == DELUGE_DEVICE_ID and 
-                data[5] == 0x05):  # JSON response command
+                data[5] == 0x07):  # JSON response command (0x07)
                 
                 # Extract JSON payload
                 json_start = 7
@@ -282,13 +282,21 @@ class Fetcher(object):
             # Step 1: Open the file
             open_cmd = {
                 "open": {
-                    "path": file_path
+                    "path": file_path,
+                    "write": 0  # 0 = read mode
                 }
             }
             
-            fid = self._send_json_command(outport, inport, open_cmd, seq_num)
-            if not fid:
+            open_response = self._send_json_command(outport, inport, open_cmd, seq_num)
+            if not open_response or open_response.get('err', -1) != 0:
                 logger.info(f'Could not open file: {file_path}')
+                return None
+            
+            fid = open_response.get('fid')
+            file_size = open_response.get('size', 0)
+            
+            if not fid or fid < 1:
+                logger.info(f'Invalid file descriptor returned: {fid}')
                 return None
             
             seq_num = (seq_num + 1) if seq_num < seq_max else 1
@@ -298,24 +306,27 @@ class Fetcher(object):
             block_size = 512
             current_addr = 0
             
-            while True:
+            logger.info(f'Reading file {file_path} (size: {file_size} bytes)')
+            
+            while current_addr < file_size:
                 read_cmd = {
                     "read": {
                         "fid": fid,
                         "addr": current_addr,
-                        "size": block_size
+                        "size": min(block_size, file_size - current_addr)
                     }
                 }
                 
                 block_data = self._send_json_command_with_data(outport, inport, read_cmd, seq_num)
                 if not block_data:
+                    logger.info(f'No data received at offset {current_addr}')
                     break
                 
                 file_data.extend(block_data)
                 current_addr += len(block_data)
                 
-                # If we got less than block_size, we've reached the end
-                if len(block_data) < block_size:
+                # If we got less than requested, we've reached the end
+                if len(block_data) < min(block_size, file_size - current_addr + len(block_data)):
                     break
                 
                 seq_num = (seq_num + 1) if seq_num < seq_max else 1
@@ -328,6 +339,7 @@ class Fetcher(object):
             }
             self._send_json_command(outport, inport, close_cmd, seq_num)
             
+            logger.info(f'Successfully read {len(file_data)} bytes from {file_path}')
             return bytes(file_data)
             
         except Exception as e:
@@ -360,6 +372,7 @@ class Fetcher(object):
                             return self._extract_response_data(response, command)
                 time.sleep(0.01)
             
+            logger.info(f'Timeout waiting for response to {list(command.keys())[0]} command')
             return None
             
         except Exception as e:
@@ -373,7 +386,7 @@ class Fetcher(object):
             if (len(data) > 7 and 
                 data[1:4] == DELUGE_MANUFACTURER_ID and 
                 data[4] == DELUGE_DEVICE_ID and 
-                data[5] == 0x05):  # JSON response command
+                data[5] == 0x07):  # JSON response command (0x07)
                 
                 # Extract JSON payload
                 json_start = 7
@@ -391,26 +404,22 @@ class Fetcher(object):
         """Extract relevant data from JSON response based on original command"""
         try:
             cmd_type = list(original_command.keys())[0]
+            response_key = f"^{cmd_type}"
             
-            if cmd_type == "open":
-                if "^open" in response:
-                    open_resp = response["^open"]
-                    if open_resp.get("err") == 0:
-                        return open_resp.get("fid")
-            
-            elif cmd_type == "read":
-                if "^read" in response:
-                    read_resp = response["^read"]
-                    if read_resp.get("err") == 0:
-                        # For read commands, we need to extract binary data
-                        # This is placeholder - binary data extraction needs SysEx message context
-                        return b""  # Will be updated when we have the full SysEx parsing
-            
-            elif cmd_type == "close":
-                if "^close" in response:
-                    close_resp = response["^close"]
-                    if close_resp.get("err") == 0:
-                        return True
+            if response_key in response:
+                resp_data = response[response_key]
+                
+                if cmd_type == "open":
+                    # Return the full response data for open command
+                    return resp_data
+                
+                elif cmd_type == "read":
+                    # Return the response data - binary data handled separately
+                    return resp_data
+                
+                elif cmd_type == "close":
+                    # Return success status
+                    return resp_data.get("err", -1) == 0
         
         except Exception as e:
             logger.info(f'Error extracting response data: {e}')
@@ -448,6 +457,7 @@ class Fetcher(object):
                                 return self._extract_response_data(response, command)
                 time.sleep(0.01)
             
+            logger.info(f'Timeout waiting for response to {list(command.keys())[0]} command')
             return None
             
         except Exception as e:
@@ -466,20 +476,20 @@ class Fetcher(object):
             if read_resp.get("err") != 0:
                 return None
             
-            # Look for binary data separator (0x00) after JSON
-            json_start = 7
-            json_end = len(sysex_data) - 1  # Remove SYSEX_EOX
+            # Find the zero separator between JSON and binary data
+            # Start searching after the SysEx header and sequence number
+            payload_start = 7  # After [F0 00 21 7B 01 07 seq]
+            zero_x = len(sysex_data) - 1  # Default to end if no separator found
             
-            # Find end of JSON data by looking for null separator
-            separator_pos = -1
-            for i in range(json_start, json_end):
+            # Search for null separator (0x00) that marks end of JSON
+            for i in range(payload_start, len(sysex_data) - 1):
                 if sysex_data[i] == 0x00:
-                    separator_pos = i
+                    zero_x = i
                     break
             
-            if separator_pos > 0:
-                # Extract binary data after separator
-                binary_data = self._extract_attached_data(sysex_data, separator_pos)
+            # If binary data exists, extract and unpack it
+            if zero_x < len(sysex_data) - 2:  # Must have at least separator + 1 byte + F7
+                binary_data = self._extract_attached_data(sysex_data, zero_x)
                 return bytes(binary_data)
             
             return b""  # No binary data found

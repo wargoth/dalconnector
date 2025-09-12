@@ -3,8 +3,9 @@ from __future__ import absolute_import, print_function, unicode_literals
 from ableton.v2.base import const, inject, listens
 from ableton.v2.control_surface import ControlSurface
 
-from .config import WATCH_FOR_NEW_SAVES
+from .config import WATCH_FOR_NEW_SAVES, CONNECTION_METHOD
 from .fetcher import ThreadShare
+from .usb_fetcher import USBThreadShare
 from .local import propername, displayname
 
 from time import sleep
@@ -76,7 +77,10 @@ class DALConnector(ControlSurface):
         # logger.info(f'Deluge song is {self.delugesong}')
 
         if self.ts is None:
-            self.ts = ThreadShare()
+            if CONNECTION_METHOD.upper() == "USB":
+                self.ts = USBThreadShare()
+            else:
+                self.ts = ThreadShare()
 
 
         self.ts.fetchsong(self.delugesong)

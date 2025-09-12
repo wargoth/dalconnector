@@ -1,8 +1,11 @@
 
+# Connection method: "USB" for direct USB connection, "WIFI" for WiFi SD card
+CONNECTION_METHOD = "USB"  # "USB" (default) or "WIFI"
 
 # You have a WiFi sdcard.  What is the address you use to connect to it
 # Make sure you can visit it in your web browser.  If you can load it in a web browser it's very likely it will work here.
 # Enter just the address part.  For instance, if you visit it via "http://flashair/" just enter "flashair" here:
+# This is only used when CONNECTION_METHOD is set to "WIFI"
 WIFI_CARD_ADDRESS = "flashaircard"  # an IP address or a hostname such as flashair
 
 

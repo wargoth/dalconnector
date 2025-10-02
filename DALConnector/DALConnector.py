@@ -3,9 +3,9 @@ from __future__ import absolute_import, print_function, unicode_literals
 from ableton.v2.base import const, inject, listens
 from ableton.v2.control_surface import ControlSurface
 
-from .config import WATCH_FOR_NEW_SAVES, CONNECTION_METHOD
+from .config import WATCH_FOR_NEW_SAVES
 from .fetcher import ThreadShare
-from .usb_fetcher import USBThreadShare
+from .deluge2ableton import Deluge2Ableton
 from .local import propername, displayname
 
 from time import sleep
@@ -16,26 +16,179 @@ import re
 
 logger = logging.getLogger(__name__)
 
+# Global SysEx interception flag
+_SYSEX_INTERCEPTOR_INSTALLED = False
+
+def install_global_sysex_interceptor():
+    """Install global SysEx interceptor at module level"""
+    global _SYSEX_INTERCEPTOR_INSTALLED
+    if _SYSEX_INTERCEPTOR_INSTALLED:
+        return
+
+    try:
+        # Try to patch at the ControlSurface level
+        from ableton.v2.control_surface import ControlSurface
+
+        if hasattr(ControlSurface, 'receive_midi'):
+            original_receive_midi = ControlSurface.receive_midi
+            logger.info("Installing global SysEx interceptor on ControlSurface.receive_midi")
+
+            def global_receive_midi_interceptor(self, midi_bytes):
+                logger.debug(f"GLOBAL INTERCEPTOR: {self.__class__.__name__} received {len(midi_bytes) if midi_bytes else 0} bytes")
+
+                if midi_bytes and midi_bytes[0] == 0xF0:
+                    logger.info(f"GLOBAL SysEx intercepted for {self.__class__.__name__}: {[hex(b) for b in midi_bytes[:10]]}")
+
+                    # If this is our DALConnector instance, handle it
+                    if isinstance(self, DALConnector) and hasattr(self, '_handle_sysex_message'):
+                        logger.info("Routing SysEx to DALConnector handler")
+                        self._handle_sysex_message(midi_bytes)
+                        return
+
+                # Call original method
+                original_receive_midi(self, midi_bytes)
+
+            ControlSurface.receive_midi = global_receive_midi_interceptor
+            _SYSEX_INTERCEPTOR_INSTALLED = True
+            logger.info("Global SysEx interceptor installed successfully")
+        else:
+            logger.warning("ControlSurface.receive_midi not found for global interception")
+
+    except Exception as e:
+        logger.error(f"Error installing global SysEx interceptor: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
 
 class DALConnector(ControlSurface):
     WATCH_INTERVAL_SLEEP = 10  # Wait time between polling, 20 is 2 seconds
 
+    # Deluge SysEx constants
+    DELUGE_SYSEX_HEADER = [0xF0, 0x00, 0x21, 0x7B, 0x01]
+    SYSEX_END = 0xF7
+
+    # Commands
+    CMD_PING = 0x00
+    CMD_POPUP = 0x01
+    CMD_HID = 0x02
+    CMD_DEBUG = 0x03
+    CMD_JSON = 0x04
+    CMD_JSON_REPLY = 0x05
+    CMD_PONG = 0x7F
+
     def __init__(self, *a, **k):
         super(DALConnector, self).__init__(*a, **k)
+
+        # Request to receive all MIDI including SysEx
+        self._do_receive_midi = True
+        self._suppress_send_midi = False
+
         with self.component_guard():
             self.finished = False
             self.eventloopstarted = False
 
             self.ts = None
-            logger.info(u'--- DAL Connector Started ---')
+            logger.info(u'--- DAL Connector Started (USB SysEx Mode) ---')
+            logger.info(f'Requesting SysEx delivery: _do_receive_midi={self._do_receive_midi}')
+
+            # Install global SysEx interceptor
+            install_global_sysex_interceptor()
+
+            # Initialize USB fetcher
+            self.ts = ThreadShare(self)
 
             self.__on_selected_track_name_changed.subject = self.song.view
 
             self._resetvars()
 
 
+
+    def _on_received_midi(self, *midi_bytes):
+        """Callback for received MIDI messages - receives bytes as individual arguments"""
+        logger.info(f"_on_received_midi callback: {len(midi_bytes)} bytes")
+        try:
+            if midi_bytes and len(midi_bytes) > 0 and midi_bytes[0] == 0xF0:
+                logger.info(f"SysEx via callback: {[hex(b) for b in midi_bytes[:20]]}")
+                # Forward to fetcher for processing
+                if self.ts and hasattr(self.ts, 'fetcher'):
+                    self.ts.fetcher.handle_sysex_response(list(midi_bytes))
+        except Exception as e:
+            logger.error(f"Error in _on_received_midi: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    def receive_midi(self, midi_bytes):
+        """Handle incoming MIDI messages including SysEx"""
+        logger.debug(f"receive_midi called with {len(midi_bytes) if midi_bytes else 0} bytes")
+        try:
+            if midi_bytes and midi_bytes[0] == 0xF0:  # SysEx message
+                logger.info(f"Received SysEx message: {[hex(b) for b in midi_bytes[:10]]}")
+                self._handle_sysex_message(midi_bytes)
+                return  # Don't call parent for SysEx messages we handle
+            else:
+                # Let parent handle other MIDI messages
+                super(DALConnector, self).receive_midi(midi_bytes)
+        except Exception as e:
+            logger.error(f"Error processing MIDI: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+
+    def build_midi_map(self, midi_map_handle):
+        """Request SysEx messages from Ableton"""
+        logger.info("build_midi_map called - requesting SysEx delivery")
+
+        # Register for Deluge SysEx messages
+        # Deluge manufacturer ID: 0x00 0x21 0x7B
+        try:
+            from ableton.v2.control_surface.elements import SysexElement
+
+            # Register a SysEx listener for Deluge messages
+            # Header: F0 00 21 7B 01 (Deluge SysEx header)
+            sysex_identifier = (0xF0, 0x00, 0x21, 0x7B, 0x01)
+
+            logger.info(f"Registering SysEx identifier: {[hex(b) for b in sysex_identifier]}")
+
+            # Add listener for received MIDI
+            if not self.received_midi_has_listener(self._on_received_midi):
+                self.add_received_midi_listener(self._on_received_midi)
+                logger.info("Added received MIDI listener")
+
+        except Exception as e:
+            logger.error(f"Error registering SysEx: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+        super(DALConnector, self).build_midi_map(midi_map_handle)
+        logger.info("build_midi_map completed")
+
+    def suggest_input_port(self):
+        """Suggest input port for Deluge"""
+        logger.info("suggest_input_port called")
+        return str("Deluge")
+
+    def suggest_output_port(self):
+        """Suggest output port for Deluge"""
+        logger.info("suggest_output_port called")
+        return str("Deluge")
+
+    def can_lock_to_devices(self):
+        """Indicate that we don't lock to devices"""
+        return False
+
+    def handle_sysex(self, midi_bytes):
+        """Handle SysEx messages from Ableton's routing"""
+        logger.info(f"handle_sysex called with {len(midi_bytes) if midi_bytes else 0} bytes")
+        if midi_bytes and self.ts and hasattr(self.ts, 'fetcher'):
+            logger.info(f"SysEx via handle_sysex: {[hex(b) for b in midi_bytes[:20]]}")
+            self.ts.fetcher.handle_sysex_response(list(midi_bytes))
+
     def disconnect(self):
         self.finished = True
+
+        # Remove MIDI listener
+        if self.received_midi_has_listener(self._on_received_midi):
+            self.remove_received_midi_listener(self._on_received_midi)
 
         if self.ts:
             self.ts.disconnect()
@@ -76,17 +229,9 @@ class DALConnector(ControlSurface):
 
         # logger.info(f'Deluge song is {self.delugesong}')
 
-        if self.ts is None:
-            if CONNECTION_METHOD.upper() == "USB":
-                self.ts = USBThreadShare()
-            else:
-                self.ts = ThreadShare()
-
-
+        # Fetch song using USB SysEx
         self.ts.fetchsong(self.delugesong)
-
         self._addtrackmsg(f'[fetching...]')
-
         self.expectsong = self.delugesong
 
         if not self.eventloopstarted:

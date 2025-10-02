@@ -1,37 +1,53 @@
-from .config import WIFI_CARD_ADDRESS, WEB_PATH_PREFIX, SOCKET_TIMEOUT
 from .config import WATCH_FOR_NEW_SAVES, NEW_SAVE_SLEEP_TIMER
 from .deluge2ableton import Deluge2Ableton
 from .local import propername, displayname
 
-import _thread
-import socket
 import logging
-import re
 import time
-
+import json
+import _thread
 from time import sleep
 
 logger = logging.getLogger(__name__)
 
 
 class Fetcher(object):
+    """USB SysEx-based fetcher for Deluge communication using Ableton's native MIDI"""
+
     MAX_RECURSION = 250
-
     SLEEPTIME = 1.0
+    SYSEX_TIMEOUT = 5.0
 
-    KNOWN_CACHE = {}           # What's the last known song in a series...  2, 2a, 2b, 2c...
+    # Deluge SysEx constants
+    DELUGE_SYSEX_HEADER = [0xF0, 0x00, 0x21, 0x7B, 0x01]
+    SYSEX_END = 0xF7
+
+    # Commands
+    CMD_PING = 0x00
+    CMD_JSON = 0x04
+    CMD_JSON_REPLY = 0x05
+    CMD_PONG = 0x7F
+
+    KNOWN_CACHE = {}
+
+    def __init__(self, control_surface):
+        """Initialize fetcher with reference to control surface for MIDI communication"""
+        self.control_surface = control_surface
+        self.sequence_num = 1
+        self.pending_responses = {}
+        self.response_callbacks = {}
 
     def start(self, ts):
         self.ts = ts
         self.nextsong = None
         self.scanstarttime = None
 
-        # logger.info(f' FETCHER THREAD STARTING')
+        logger.info('USB Fetcher starting (using Ableton native SysEx)')
 
         try:
             self.loop()
         except Exception as e:
-            logger.info(f'MAJOR THREAD EXCEPTION!  {e}')
+            logger.error(f'MAJOR THREAD EXCEPTION! {e}')
 
     def loop(self):
         while True:
@@ -144,40 +160,193 @@ class Fetcher(object):
         return None
 
 
+    def handle_sysex_response(self, sysex_data):
+        """Called by control surface when SysEx response is received"""
+        try:
+            if len(sysex_data) < 8:
+                return
+
+            # Verify Deluge SysEx
+            if list(sysex_data[0:5]) != self.DELUGE_SYSEX_HEADER:
+                return
+
+            command = sysex_data[5]
+
+            if command == self.CMD_JSON_REPLY:
+                sequence = sysex_data[6]
+
+                # Parse JSON and binary data
+                json_start = 7
+                json_end = len(sysex_data) - 1
+                binary_data = None
+
+                for i in range(json_start, json_end):
+                    if sysex_data[i] == 0x00:
+                        json_end = i
+                        binary_data = sysex_data[i+1:-1]
+                        break
+
+                json_bytes = sysex_data[json_start:json_end]
+                json_str = ''.join(chr(b) for b in json_bytes)
+                response_data = json.loads(json_str)
+
+                # Store response
+                self.pending_responses[sequence] = {
+                    'json': response_data,
+                    'binary': binary_data,
+                    'received': True
+                }
+
+                # Call callback if registered
+                if sequence in self.response_callbacks:
+                    callback = self.response_callbacks[sequence]
+                    del self.response_callbacks[sequence]
+                    callback(response_data, binary_data)
+
+        except Exception as e:
+            logger.error(f"Error handling SysEx response: {e}")
+
+    def _send_json_command(self, command_dict, callback=None):
+        """Send JSON command to Deluge via SysEx"""
+        try:
+            sequence = self.sequence_num
+            self.sequence_num = (self.sequence_num % 127) + 1
+
+            json_str = json.dumps(command_dict)
+            json_bytes = [ord(c) & 0x7F for c in json_str]
+
+            message = tuple(self.DELUGE_SYSEX_HEADER +
+                          [self.CMD_JSON, sequence] +
+                          json_bytes +
+                          [self.SYSEX_END])
+
+            self.pending_responses[sequence] = {'received': False}
+            if callback:
+                self.response_callbacks[sequence] = callback
+
+            # Send via control surface
+            self.control_surface._send_midi(message)
+            logger.debug(f"Sent JSON command sequence {sequence}: {command_dict}")
+
+            return sequence
+
+        except Exception as e:
+            logger.error(f"Error sending JSON command: {e}")
+            return None
+
+    def _wait_for_response(self, sequence, timeout=None):
+        """Wait for response to a JSON command"""
+        if timeout is None:
+            timeout = self.SYSEX_TIMEOUT
+
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            response = self.pending_responses.get(sequence)
+            if response and response.get('received', False):
+                del self.pending_responses[sequence]
+                return response
+            sleep(0.1)
+
+        # Timeout
+        if sequence in self.pending_responses:
+            del self.pending_responses[sequence]
+        return None
+
+    def _unpack_7bit_to_8bit(self, data):
+        """Unpack 7-bit MIDI data to 8-bit bytes"""
+        if not data:
+            return b''
+
+        src_len = len(data)
+        packets = (src_len + 7) // 8
+        missing = (8 * packets - src_len)
+
+        if missing == 7:
+            packets -= 1
+            missing = 0
+
+        out_len = 7 * packets - missing
+        result = bytearray(out_len)
+
+        for i in range(packets):
+            ipos = 8 * i
+            opos = 7 * i
+
+            if ipos >= src_len:
+                break
+
+            rot_bit = 1
+            high_bits = data[ipos]
+
+            for j in range(7):
+                if not (j + 1 + ipos < src_len):
+                    break
+                if opos + j >= out_len:
+                    break
+
+                result[opos + j] = data[ipos + 1 + j] & 0x7F
+                if high_bits & rot_bit:
+                    result[opos + j] |= 0x80
+                rot_bit <<= 1
+
+        return bytes(result)
+
     def fetch(self, delugesong):
+        """Fetch song XML from Deluge via USB SysEx"""
         if not delugesong:
             return ''
 
-        url = f'/{WEB_PATH_PREFIX}/SONG{delugesong}.XML'
-
-        request = f"GET {url} HTTP/1.0\r\nHost: {WIFI_CARD_ADDRESS}\r\n\r\n"
+        song_path = f"/SONGS/SONG{delugesong}.XML"
 
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(SOCKET_TIMEOUT)
-            s.connect((WIFI_CARD_ADDRESS, 80))
-            s.send(request.encode('utf-8'))
+            # Open file
+            open_cmd = {"open": {"path": song_path, "write": 0}}
+            sequence = self._send_json_command(open_cmd)
 
-            body = ""
+            if sequence is None:
+                return None
 
-            while True:
-                part = s.recv(999999)
+            response = self._wait_for_response(sequence)
 
-                if not part:
-                    break
+            if not response:
+                logger.debug(f"Timeout waiting for file open: {song_path}")
+                return ""
 
-                body += part.decode('utf-8')
+            open_result = response['json']
 
-            s.close()
+            if '^open' not in open_result:
+                return ""
+
+            open_data = open_result['^open']
+            if open_data.get('err', 0) != 0:
+                return ""
+
+            file_id = open_data.get('fid')
+            file_size = open_data.get('size', 0)
+
+            if file_id is None or file_size == 0:
+                return ""
+
+            # Read file
+            read_cmd = {"read": {"fid": file_id, "offset": 0, "length": file_size}}
+            sequence = self._send_json_command(read_cmd)
+
+            if sequence is None:
+                return None
+
+            response = self._wait_for_response(sequence)
+
+            if not response or not response.get('binary'):
+                return ""
+
+            # Unpack and decode
+            xml_data = self._unpack_7bit_to_8bit(response['binary'])
+            return xml_data.decode('utf-8', errors='ignore')
+
         except Exception as e:
-            logger.info(f'ERROR: Socket Exception {e}')
+            logger.error(f'ERROR: USB fetch exception {e}')
             return None
-
-
-        if "\r\n\r\n" in body:
-            return body.split("\r\n\r\n", 2)[1]
-
-        return ''
 
 
 
@@ -202,16 +371,19 @@ class Fetcher(object):
 
 
 class ThreadShare(object):
-    def __init__(self):
+    def __init__(self, control_surface):
         self.watchmsg = None
         self.finished = False
+        self.control_surface = control_surface
         self.reset()
 
         try:
-            self.fetcher = Fetcher()
-            _thread.start_new_thread(self.fetcher.start, (self, ) )
+            self.fetcher = Fetcher(control_surface)
+            # Start background thread for fetching and watching new saves
+            _thread.start_new_thread(self.fetcher.start, (self,))
+            logger.info('ThreadShare initialized with USB fetcher - background thread started')
         except Exception as e:
-            logger.info(f'Error: unable to start thread {e}')
+            logger.error(f'Error: unable to initialize fetcher {e}')
 
     def reset(self):
         self.delugesong = None
